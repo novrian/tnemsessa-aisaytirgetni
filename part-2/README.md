@@ -26,17 +26,11 @@ But there is a trap inside detail two, and it shapes the whole answer: **a 400 c
 
 A caller sees `400` in all three cases. This is why section 1 starts where it does.
 
-**Terms used throughout.** **JVM** is the Java Virtual Machine — the program that runs Java code. **JSON** is JavaScript Object Notation, the text format the payload is written in. A **locale** is a set of regional conventions: which character separates the whole part of a number from the fraction, what order day and month go in, what the month is called. .NET calls the same idea a **culture**. A **charset** is the rule for turning text into bytes and back.
-
 ---
 
 ## 1. What I would check first, and in what order
 
-The ordering rule I use is not "check the most likely thing first". It is:
-
-> **Order by how much of the search space a check removes, divided by what the check costs.**
-
-A cheap check that eliminates half the possibilities beats an expensive check that confirms the thing you already suspect. Suspicion is the worst ordering principle, because a wrong suspicion sends you down a branch that can absorb a whole day and still end in nothing.
+The ordering rule I use is not "check the most likely thing first". A cheap check that eliminates half the possibilities beats an expensive check that confirms the thing you already suspect. Suspicion is the worst ordering principle, because a wrong suspicion sends you down a branch that can absorb a whole day and still end in nothing.
 
 Here is the order, with nothing touched yet.
 
