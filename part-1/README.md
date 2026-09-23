@@ -134,7 +134,9 @@ flowchart TD
 
 ## 2. The alternative I considered and rejected
 
-**Shared database, shared schema, `tenant_id` on every row, PostgreSQL Row-Level Security as the guard.**
+**Shared database, shared schema, `tenant_id` on every row, PostgreSQL Row-Level Security (RLS) as the guard.**
+
+> **Row-Level Security (RLS)** is a PostgreSQL feature that attaches a permanent filter to a table. Once a policy is in place, the database itself adds `AND tenant_id = <the current tenant>` to every query against that table — whether or not the application remembered to. The application can't opt out of it, and a developer writing a query by hand can't forget it. It moves tenant isolation from *something the code promises* to *something the database enforces*.
 
 ```sql
 -- The rejected shape.
@@ -179,9 +181,24 @@ CREATE TABLE tenant_module (
 );
 ```
 
-### The four doors
+### The four doors — the part that's easy to get wrong
 
-A module isn't one entrance. It's four, and "off" is only as strong as the weakest one. In my experience this is where module gating actually fails: teams guard the HTTP layer, ship, and six months later discover a disabled module's Kafka consumer has been quietly processing that tenant's events the whole time.
+**What "door" means here:** a way that a module's code can start running. It is natural to think of a module as a set of screens, so "turning it off" sounds like hiding the menu item. It isn't. A module's code can be triggered by four independent things, and hiding the menu stops only one of them.
+
+Picture the module as a building with four entrances. Locking the front door feels like you've closed the building. But the loading dock is still open, the back stairwell is still open, and the mail slot is still accepting deliveries. Anyone — or any event — coming in that way walks straight into the module.
+
+The four entrances are:
+
+| # | Door | What triggers it | What happens if you forget to guard it |
+|---|---|---|---|
+| 1 | **HTTP endpoint** | A user or an integration calls `/api/hr/employees` | The tenant's menu shows no HR, but anyone who knows the URL can still call the API and read or write HR data |
+| 2 | **Scheduled job** | A timer inside the app fires at 02:00 | A nightly payroll job runs for a tenant who doesn't have HR — creating records, sending emails, touching data the tenant never bought |
+| 3 | **Event/queue consumer** | A message arrives on Kafka from another module | A disabled module keeps reacting to events and silently writing data, invisibly, for months |
+| 4 | **UI menu** | The front end asks the server what to render | The tenant sees a feature they haven't paid for, clicks it, and gets an error — a support ticket and a bad first impression |
+
+So yes — these are the **vulnerable points of the design**. Not vulnerabilities in the sense of a security hole an attacker exploits (though door 1 is exactly that), but in the sense that *the feature toggle is only as true as its least-guarded entrance*. If one is missed, the module is "off" in the product's own admin screen while still running in reality — which is worse than being obviously on, because nobody is looking for it.
+
+This is where module gating fails in practice. The common failure is that a team guards door 1, ships, and six months later discovers the disabled module's queue consumer has been quietly processing that tenant's events the entire time. The fix is not vigilance; it's making each door's guard *declarative and greppable*, so a reviewer can check all four in one search, and so adding a fifth kind of entry point later forces an explicit decision.
 
 ```java
 // Door 1 — HTTP. Declarative, so it's visible in review.
@@ -232,16 +249,18 @@ List<ModuleDescriptor> myModules() {
 
 ```mermaid
 flowchart LR
-    ADM["Tenant admin<br/>or billing system"] -->|UPDATE enabled = true| TM[("tenant_module row")]
-    TM --> EV["event:<br/>tenant.entitlements.changed"]
-    EV --> CACHE["Entitlement cache<br/>(per pod)"]
+    ADM["Tenant admin<br/>or billing system"] -->|"UPDATE enabled = true"| TM[("tenant_module<br/>source of truth")]
+    TM --> L2["Redis — shared entitlement cache<br/>one answer for the whole cluster"]
+    L2 -->|"pub/sub: entitlements.changed"| L1A["Pod A — L1 cache (~5s)"]
+    L2 --> L1B["Pod B — L1 cache (~5s)"]
+    L2 --> L1C["Pod C — L1 cache (~5s)"]
 
-    CACHE --> D1["Door 1 — HTTP<br/>@RequiresModule"]
-    CACHE --> D2["Door 2 — Scheduled jobs<br/>tenantsWith('hr')"]
-    CACHE --> D3["Door 3 — Event consumers<br/>skip if disabled"]
-    CACHE --> D4["Door 4 — UI menu<br/>/api/me/modules"]
+    L1A --> D1["Door 1 — HTTP<br/>@RequiresModule"]
+    L1A --> D2["Door 2 — Scheduled jobs<br/>tenantsWith('hr')"]
+    L1A --> D3["Door 3 — Event consumers<br/>skip if disabled"]
+    L1A --> D4["Door 4 — UI menu<br/>/api/me/modules"]
 
-    D1 --> APP["Module code<br/>(always deployed)"]
+    D1 --> APP["Module code<br/>(always deployed, gated at every door)"]
     D2 --> APP
     D3 --> APP
     D4 --> APP
@@ -256,7 +275,39 @@ flowchart LR
 Set<String> enabledFor(UUID tenantId) { /* ... */ }
 ```
 
-There are two acceptable resolutions and one unacceptable one. Acceptable: publish a `tenant.entitlements.changed` event and have every pod evict on receipt (fast, adds a dependency on the broker being healthy); or accept a bounded TTL and **write "changes take effect within 60 seconds" into the product contract**. Unacceptable: leave it undefined and let support field the "I turned it on and nothing happened" tickets. I'd take the event, with a TTL as the backstop for a missed message.
+The unacceptable answer is to leave this undefined and let support field the "I turned it on and nothing happened" tickets. The question is which defined answer to pick.
+
+**A per-pod cache with a TTL** is the simplest: each pod caches for 60 seconds and you write *"module changes take effect within 60 seconds"* into the product contract. No new infrastructure. But the freshness guarantee is weak in a specific way that matters — it's 60 seconds **per pod, unsynchronised**, so during that window two users at the same client can get different answers depending on which pod they hit. That's confusing to explain to a customer and awkward to reproduce in support.
+
+**Redis as a shared entitlement cache** removes that. Every pod reads the same value, so there is one answer at any moment, and an admin toggle is visible everywhere as soon as the key is written rather than whenever each pod's local timer happens to expire. For an entitlement — which is a **billing-backed fact**, not a preference — that's the right guarantee. A tenant who just paid for procurement should see it now, and a tenant whose subscription lapsed should lose access now, not "within a minute, on most pods."
+
+I'd take Redis, in a two-level arrangement so the correctness win doesn't cost a network round-trip on every request:
+
+```java
+// Illustrative. L1 = in-process (microseconds), L2 = Redis (shared truth).
+Set<String> enabledFor(UUID tenantId) {
+    return l1.get(tenantId, () ->                       // ~5s TTL, absorbs request bursts
+           redis.get(key(tenantId), () ->               // shared across all pods
+           loadFromDatabase(tenantId)));                // cold path only
+}
+
+// The writer updates Redis and tells every pod to drop its L1 copy.
+@Transactional
+void setEnabled(UUID tenantId, String moduleKey, boolean enabled) {
+    repo.upsert(tenantId, moduleKey, enabled);          // database is the source of truth
+    redis.del(key(tenantId));                           // L2 invalidated
+    redis.publish("entitlements.changed", tenantId);    // pub/sub -> every pod evicts L1
+}
+```
+
+Redis pub/sub does the cluster-wide eviction, so the worst-case staleness is the L1 TTL (a few seconds) rather than a full minute, and it's the *same* few seconds everywhere.
+
+**What this costs, stated honestly:**
+
+- **Redis becomes a dependency in the request path.** If it's unreachable, every entitlement check would go to the database — which is survivable but is a sudden load spike on the control plane exactly when something is already wrong. So the fallback has to be designed, not discovered: serve the last-known-good L1 value past its TTL when Redis is down, and alarm on it. **Never fail open** (treating an unreachable cache as "all modules enabled") — that would hand tenants features they haven't paid for during an outage.
+- **Pub/sub is fire-and-forget.** A pod that was restarting when the message went out never receives it, which is precisely why the L1 TTL stays in place as a backstop rather than being set to infinity.
+- **It's another stateful component** to run, monitor, secure and patch. On AKS that's Azure Cache for Redis — a real line item and a real operational surface, justified here because the same cache serves session and rate-limit state, not by entitlements alone.
+- **The database remains the source of truth.** Redis holds a derived copy. If the two ever disagree, the database wins and the cache is rebuilt — which means no toggle is ever lost because a cache write failed.
 
 ### Disabling is harder than enabling
 
@@ -287,13 +338,50 @@ class ModuleBoundaryTest {
 
 That rule is the entire extraction strategy. The day a tenant's load forces CRM out into its own service, the seams already exist — because CI refused to let anyone cross them for the preceding two years.
 
+### Scaling by module demand, without splitting the codebase
+
+A fair objection to a monolith is that you can't scale a busy module independently — if procurement is hammered at month-end, you have to scale the whole application. In practice you can get most of that benefit while keeping one codebase, and it's worth being precise about how much.
+
+**The same image is deployed several times, each with a different runtime role.** A Spring profile decides which doors that replica opens:
+
+```yaml
+# Illustrative — one image, three Deployments, different roles.
+# erp-web-general : ROLES=http                 replicas 4   (everything except procurement)
+# erp-web-procure : ROLES=http,module=procure  replicas 12  (month-end spike)
+# erp-workers     : ROLES=jobs,consumers       replicas 2   (no HTTP traffic at all)
+```
+
+```java
+@Configuration
+@ConditionalOnProperty(name = "roles.jobs", havingValue = "true")
+class SchedulerConfig { /* @Scheduled beans exist ONLY in this role */ }
+```
+
+The gateway routes `/api/procurement/**` to the procurement pool and everything else to the general pool. A Horizontal Pod Autoscaler then scales each pool on its own metrics, so month-end procurement load adds twelve pods to procurement and none to HR.
+
+**What this genuinely buys:**
+
+- **Capacity scales per module.** The expensive module gets the replicas; the quiet ones don't.
+- **Partial blast-radius isolation.** A memory leak or a thread-pool exhaustion in procurement takes down the procurement pool. HR-only tenants, served by the general pool, keep working. That directly softens the "one image, shared failure" weakness noted above.
+- **Background work is isolated from user traffic**, which is the higher-value split in most ERP systems — a long-running report or a nightly job can no longer starve the threads serving interactive requests.
+- **No code change to get it.** It's a deployment topology decision, reversible in an afternoon, made without touching a line of application code.
+
+**Where the claim has to stop, because overstating it would be wrong:**
+
+- **Footprint doesn't shrink, only throughput scales.** Every replica still loads the entire application — all modules' classes, all beans, the full heap baseline. Twelve procurement pods each carry HR and CRM code they never execute. Compared to a true microservice, you're paying for memory you don't use, so the cost saving is smaller than the architecture diagram suggests.
+- **Scheduled jobs must run in exactly one role.** If the `@Scheduled` beans are active in all three deployments, the nightly payroll run fires eighteen times. The `@ConditionalOnProperty` guard above is what prevents that, and it needs a leader-election or a distributed lock as a second safeguard — this is the sharpest edge in the whole arrangement and it's easy to miss.
+- **Deploys stay coupled.** A hotfix to procurement still rebuilds and redeploys the one artifact. You've decoupled *scaling*, not *release cadence* — and release independence is the thing teams usually want microservices for.
+- **It's more configuration to reason about.** Three deployments, three autoscaler configs, and a gateway routing table that must stay in step with the module list.
+
+So the honest framing is: **this covers the scaling argument for module-per-service, but not the release-independence or footprint arguments.** When a module needs its own deploy schedule or its own memory profile, that's the signal to extract it — and the ArchUnit boundaries above are what make that extraction a week's work instead of a quarter's.
+
 **Rejected: dynamic classloading (OSGi-style).** Loading a JAR at runtime is four lines. *Unloading* is the problem: every reference has to go — cached classes, thread-locals, registered JDBC drivers, Spring beans the module created. Miss one and the classloader can't be collected, and after enough cycles the pod dies of metaspace exhaustion. OSGi spent two decades on this and Spring Boot's flat-classpath assumption fights you the whole way. More to the point, it solves a problem that no longer exists: dynamic loading mattered when redeploying meant a long outage. On AKS a rolling image update is ninety seconds with no downtime. I'd be paying a permanent complexity tax for a capability Kubernetes already gives me.
 
-**Rejected for now: module-per-service.** Real isolation and independent release cadence, and I expect to end up here for one or two modules eventually. Not yet, because a purchase order that updates budget and inventory is currently one database transaction, and splitting it makes it a saga with compensating actions — a large correctness cost paid before there's a problem to justify it. Plus every developer's laptop would need six services running to debug one feature.
+**Rejected for now: module-per-service.** Real isolation and independent release cadence, and I expect to end up here for one or two modules eventually. Not yet, for three reasons. A purchase order that updates budget and inventory is currently one database transaction, and splitting it makes it a saga with compensating actions — a large correctness cost paid before there's a problem to justify it. Every developer's laptop would need six services running to debug one feature. And the most commonly cited reason to split — independent scaling — is largely available already through the role-based deployment topology above, without paying either of those costs. What role-based deployment *doesn't* give me is independent release cadence and a smaller per-pod footprint, so those are the conditions I'd watch for as the real trigger to extract a module.
 
 ### Where this is weak
 
-Every tenant's image contains every module's code, including modules they don't own — so a defect in procurement can crash the pod serving an HR-only tenant. Module tables exist in every schema whether or not the module is enabled. And the gating is only as good as the least-guarded door, which is a discipline problem that will recur every time someone adds a new entry point.
+Every tenant's image contains every module's code, including modules they don't own. Role-based deployment pools limit the fallout — a procurement defect takes down the procurement pool, not the general one — but it doesn't eliminate it, and every replica still carries the memory footprint of modules it never runs. Module tables exist in every schema whether or not the module is enabled. Entitlement freshness now depends on Redis being healthy, with a designed fallback rather than an assumed one. And the gating is only as good as the least-guarded door, which is a discipline problem that recurs every time someone adds a new entry point.
 
 ---
 
@@ -431,7 +519,7 @@ All three are infrastructure-level mistakes, invisible in a code review of busin
 
 The principle is that one mistake must never be sufficient.
 
-**RLS as a second lock, kept even though schemas already separate tenants.** The redundancy is the point:
+**Row-Level Security (RLS) as a second lock, kept even though schemas already separate tenants.** RLS is the PostgreSQL feature described in section 2 — the database attaches a permanent tenant filter to every query, independent of what the application asks for. Here it's deliberate redundancy: the schema separation is the primary lock, and RLS is the one that holds if the primary fails.
 
 ```sql
 ALTER TABLE employee ENABLE ROW LEVEL SECURITY;
@@ -501,6 +589,8 @@ void promote(UUID tenantId) {
 | Tiered: pooled schemas + dedicated DBs | Sellable across price points; a real isolation story for regulated clients | Two of every runbook; a promotion path to build and rehearse |
 | Rejected shared-schema + RLS | Avoids platform-wide blast radius; leaves room for per-tenant DDL | Gives up the cheapest per-tenant cost and the single-migration simplicity |
 | Entitlement registry, modules always deployed | Toggle without redeploy; trivial mechanism; no classloader risk | Every tenant carries every module's code; four doors to guard |
+| Redis-backed entitlement cache (L1 + L2) | One answer cluster-wide; a billing-backed fact is fresh everywhere at once | Redis in the request path; a fallback that must be designed, never fail-open |
 | Modular monolith with CI-enforced boundaries | One transaction, one dev environment, extraction stays possible | Boundaries hold only while the CI rules do |
+| Role-based deployment pools (one image, many roles) | Per-module scaling and partial blast-radius isolation with no code change | Footprint doesn't shrink; release cadence stays coupled; scheduled jobs must run in exactly one role |
 | Out-of-process third-party modules | No foreign code in my JVM; bounded credential scope | No cross-boundary joins or transactions; some customizations are simply "no" |
 | `ext` JSONB + per-tenant migration lane | Custom fields with no DDL; custom tables without touching other tenants | Weaker typing; migration fan-out and drift to manage |
