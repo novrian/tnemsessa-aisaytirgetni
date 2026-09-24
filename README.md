@@ -8,7 +8,7 @@ parts. Each part has its own folder with a full written answer.
 | [part-1/](part-1/README.md) | Multi-Tenant / Plugin Architecture | Done |
 | [part-2/](part-2/README.md) | Java ↔ .NET Debugging | Done |
 | [part-3/](part-3/README.md) | CI/CD Pipeline Design | Done |
-| [part-4/](part-4/) | Disagreement & Team Leadership | Not started |
+| [part-4/](part-4/README.md) | Disagreement & Team Leadership | Done |
 
 The original brief is
 `Senior Software Engineer - Take Home Assessment - 09 2026.pdf`, kept in the
