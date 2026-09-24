@@ -5,13 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Current state
 
 This repository contains the take-home assessment brief
-(`Senior Software Engineer - Take Home Assessment - 09 2026.pdf`) plus answer
-directories for each of its four sections:
+(`Senior Software Engineer - Take Home Assessment - 09 2026.pdf`), a top-level
+`README.md` that indexes the answers, and one answer directory per section of
+the brief:
 
-- `part-1/` — Multi-Tenant / Plugin Architecture
-- `part-2/` — Java ↔ .NET Debugging
-- `part-3/` — CI/CD Pipeline Design
-- `part-4/` — Disagreement & Team Leadership
+- `part-1/README.md` — Multi-Tenant / Plugin Architecture (done)
+- `part-2/README.md` — Java ↔ .NET Debugging (done)
+- `part-3/README.md` — CI/CD Pipeline Design (done)
+- `part-4/` — Disagreement & Team Leadership (not started, empty directory)
 
 There is no build tooling or tests — this is a written assessment response,
 not a running application, unless a part's answer includes sample code.
@@ -46,6 +47,7 @@ never have to re-read a sentence to work out what it says.
 
 ## Next steps
 
-Once implementation code, a written response, or a submission repo structure
-is added here, update this file with real build/test/lint commands and an
-architecture overview grounded in that code.
+- Write `part-4/README.md` (Disagreement & Team Leadership) and add it to the
+  top-level `README.md` table.
+- If implementation code is ever added to any part's answer, update this file
+  with real build/test/lint commands grounded in that code.
